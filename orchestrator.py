@@ -5,11 +5,17 @@ import os
 import sys
 
 def run_writer(partition, delta_writer):
-    try:
-        delta_writer(partition)
-        return f"Success: Partition {partition}" # Simplified return for now
-    except Exception as e:
-        return f"Error: Partition {partition} failed: {e}"
+    # Capture output for metrics
+    import io
+    from contextlib import redirect_stdout
+    
+    f = io.StringIO()
+    with redirect_stdout(f):
+        try:
+            delta_writer(partition)
+        except Exception as e:
+            print(f"Error: Partition {partition} failed: {e}")
+    return f.getvalue().strip()
 
 def main():
     # Ensure the root directory is in the path for imports
@@ -25,18 +31,20 @@ def main():
         return
 
     parser = argparse.ArgumentParser(description="Delta Concurrent Write Orchestrator")
-    parser.add_argument("--concurrency", type=int, default=10, help="Number of concurrent writes")
+    parser.add_argument("--concurrency", type=int, default=10, help="Number of concurrent workers")
+    parser.add_argument("--total-writes", type=int, default=10, help="Total number of writes to perform")
     args = parser.parse_args()
 
     concurrency = args.concurrency
-    print(f"Starting {concurrency} concurrent writes (Thread-based)...")
+    total_writes = args.total_writes
+    print(f"Starting {total_writes} writes with {concurrency} concurrent workers (Thread-based)...")
 
-    partitions = [f"p_{i}" for i in range(concurrency)]
+    partitions = [f"bench_{i}" for i in range(total_writes)]
     
     start_total = time.time()
     
-    # Capping max_workers at 200 to prevent system overload
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(concurrency, 200)) as executor:
+    # Increasing max_workers for scaling
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(concurrency, 500)) as executor:
         # Pass delta_writer to run_writer
         futures = {executor.submit(run_writer, p, delta_writer): p for p in partitions}
         
@@ -71,8 +79,8 @@ def main():
             error_count += 1
     
     print("\n--- Results ---")
-    print(f"Total time: {total_duration:.2f}s")
-    print(f"Avg time per write: {total_duration/concurrency:.4f}s")
+    print(f"Total duration: {total_duration:.2f}s")
+    print(f"Writes/Second: {success_count/total_duration:.2f}")
     print(f"Successes: {success_count}")
     print(f"Failures: {error_count}")
     print(f"Total Retries: {total_retries}")

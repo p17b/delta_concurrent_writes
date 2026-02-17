@@ -35,8 +35,7 @@ def writer(partition):
                 table_or_uri=table_path, 
                 data=data, 
                 partition_by='partition',
-                mode="append",
-                schema_mode="merge"
+                mode="append"
             )
             duration = time.time() - start_time
             print(f"Success: Partition {partition} written in {duration:.2f}s (retries: {retry_count}, wait: {total_wait_time:.2f}s)")
