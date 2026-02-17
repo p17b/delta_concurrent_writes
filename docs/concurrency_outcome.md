@@ -41,15 +41,53 @@ We applied the suggested optimizations: removed `schema_mode="merge"` and set `d
 - **Concurrent Failure**: At 50 workers, the optimized writers finished their "prep work" so fast that they hit the `_delta_log` almost simultaneously. This caused a massive spike in transaction conflicts.
 - **The Result**: Workers spent more time in exponential backoff (up to 77 seconds) than actually writing, dragging the effective throughput down to 3.57 writes/s.
 
-## Final Recommendations for Scaling Delta Writes
+## Distributed Batching (Centralized Ingestion)
 
-1.  **Batching is King**: Neither append-only nor removing merges can overcome the serial bottleneck of the Delta Log. You **must** group rows into larger batches (e.g., 1000+ rows per commit) to achieve high throughput.
-2.  **Concurrency Limit**: For unbatched writes on a local filesystem, keep concurrency low (10-20 workers). Higher concurrency just leads to "thrashing" and retries.
-3.  **Schema Enforcement**: Only use `schema_mode="merge"` when necessary. It adds a non-trivial overhead to every transaction commit.
-4.  **AppendOnly**: Use `delta.appendOnly` when your use case allows. It clarifies intent and simplifies the metadata tracking, although it won't magically solve the log contention issue.
+When multiple independent workers need to write to the same Delta table but cannot coordinate with each other, the ultimate solution is a **Centralized Ingestion Service**.
+
+### The Pattern
+1. **Central Service (FastAPI)**: A single service that receives records from all workers and buffers them in memory.
+2. **Background Flush**: The service periodically flushes its buffer (e.g., every 5 seconds) to Delta Lake in a single large transaction.
+3. **Independent Workers**: They simply send their data to the service via HTTP and don't need to worry about Delta Log concurrency or retries.
+
+### Benchmark Results (10 Distributed Workers)
+| Scenario | Total Rows | Effective Throughput | Concurrency Issues |
+| :--- | :--- | :--- | :--- |
+| Direct Write | 1000 | ~10 writes/s | **High (Many Retries)** |
+| **Centralized Ingestion** | **1000** | **~1,100 writes/s** | **Zero (1 Commit)** |
+
+### Why this works
+- **Serializes the Log**: It converts the "thundering herd" of writers into a single, predictable writer process.
+- **De-couples Workers**: Workers are no longer blocked by Delta Lake's optimistic concurrency checks. They only pay the latency of a quick HTTP request.
+- **Extreme Speed**: Because the service batches thousands of rows per commit, it achieves the massive throughput of the "Batched" scenario even with hundreds of distributed producers.
+
+## Reliability & Fault Tolerance
+
+In the final evolution of the ingestion service, we moved from an in-memory buffer to a **Persistent Write-Ahead Log (WAL)** using SQLite.
+
+### The Reliable Ingestion Pattern
+1. **Persistent Accept**: Every record is immediately written to a local SQLite database before the HTTP 200 response is sent.
+2. **Atomic Flush**:
+    - The flusher reads rows from SQLite.
+    - It commits them to Delta Lake as a batch.
+    - **Crucially**, it only deletes the rows from SQLite *after* the Delta Lake commit is confirmed.
+3. **Crash Recovery**: If the service dies, the pending records stay in the SQLite database. On restart, the background worker automatically finds and flushes them.
+
+### Verification (Crash Test)
+- We sent **500 records** to the service and **killed the process** before the flush interval.
+- **SQLite Check**: Confirmed 500 records remained on disk.
+- **Restart Check**: Upon restart, the service immediately picked up the 500 rows and successfully committed them to Delta Lake.
+
+## Final Summary of Scaling Strategies
+
+| Strategy | Ideal Use Case | Pros | Cons |
+| :--- | :--- | :--- | :--- |
+| **Batching** | Single Application | 100x+ Throughput | Needs manual buffering |
+| **Centralized Ingestion** | Distributed Workers | Scalable, Handles "Thundering Herd" | Single point of entry |
+| **SQLite WAL** | Mission-Critical Data | Fault-Tolerant, Crash-Proof | Slight latency for DB write |
 
 ### Conclusion
-Delta Lake is an incredibly robust storage layer for concurrent data ingestion, but it is **not** optimized for high-frequency small transactions. Its performance shines when you aggregate many records into a single, high-throughput batch.
+To scale Delta Lake writes beyond the physical limits of the log: **Batch your writes**. To make it reliable in a distributed environment: **Use a fault-tolerant centralized service with a disk-backed buffer.**
 
 ## How to Reproduce
 Run the orchestrator script:
